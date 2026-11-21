@@ -347,9 +347,25 @@ def parse_proc_route(text):
     return (best[1], best[2]) if best else (None, None)
 
 
+def parse_ps_routes(text):
+    """PowerShell 'Get-NetRoute' lines 'nexthop metric' -> (gateway, None) with the lowest metric."""
+    best = None
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) >= 2 and is_ipv4(p[0]) and p[0] != "0.0.0.0" and p[1].isdigit():
+            if best is None or int(p[1]) < best[0]:
+                best = (int(p[1]), p[0])
+    return (best[1], None) if best else (None, None)
+
+
 def get_default_route():
     if IS_WIN:
-        return parse_route_print(run(["route", "print", "-4", "0.0.0.0"]))
+        gw = parse_route_print(run(["route", "print", "-4"]))
+        if gw[0]:
+            return gw
+        return parse_ps_routes(powershell(
+            "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | "
+            "ForEach-Object { $_.NextHop + ' ' + ($_.RouteMetric + $_.InterfaceMetric) }"))
     if IS_MAC:
         return parse_route_get(run(["route", "-n", "get", "default"]))
     gw = parse_ip_route(run(["ip", "-4", "route", "show", "default"]))
@@ -397,9 +413,20 @@ def parse_ifconfig_ether(text):
     return norm_mac(m.group(1)) if m else None
 
 
+def _ps_address_line(text, ip):
+    return re.search(r"^\s*" + re.escape(ip) + r"/(\d+)(?:/(.*?))?\s*$", text, re.M)
+
+
 def parse_ps_prefix(text, ip):
-    m = re.search(r"^\s*" + re.escape(ip) + r"/(\d+)\s*$", text, re.M)
+    """PowerShell lines 'address/prefix/adapter name' -> prefix length for ip."""
+    m = _ps_address_line(text, ip)
     return int(m.group(1)) if m else None
+
+
+def parse_ps_alias(text, ip):
+    """... -> the adapter name (e.g. 'Wi-Fi' or 'Ethernet') that holds ip."""
+    m = _ps_address_line(text, ip)
+    return m.group(2).strip() if m and m.group(2) else None
 
 
 def parse_ipconfig_prefix(text, ip):
@@ -432,21 +459,22 @@ def powershell(command, timeout=30):
 
 
 def get_prefix_len(local_ip, iface):
+    """-> (network prefix length, adapter name if newly learned)."""
     if IS_LINUX:
         p = parse_ip_addr_prefix(run(["ip", "-o", "-4", "addr", "show"]), local_ip)
         if p is None and iface:
             p = linux_ioctl_prefix(iface)
-        return p
+        return p, None
     if IS_MAC:
-        return parse_ifconfig_prefix(run(["ifconfig"]), local_ip)
+        return parse_ifconfig_prefix(run(["ifconfig"]), local_ip), None
     if IS_WIN:
-        p = parse_ps_prefix(powershell(
-            "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { $_.IPAddress + '/' + $_.PrefixLength }"),
-            local_ip)
+        out = powershell("Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object "
+                         "{ $_.IPAddress + '/' + $_.PrefixLength + '/' + $_.InterfaceAlias }")
+        p, alias = parse_ps_prefix(out, local_ip), parse_ps_alias(out, local_ip)
         if p is None:
             p = parse_ipconfig_prefix(run(["ipconfig"]), local_ip)
-        return p
-    return None
+        return p, alias
+    return None, None
 
 
 def unique_ipv4(items, limit=3):
@@ -485,6 +513,14 @@ def get_dns_servers(local_ip):
 
 
 VPN_IFACE_RE = re.compile(r"^(tun|tap|wg|utun|ppp|ipsec|nordlynx|proton|tailscale|zt)", re.I)
+WIN_VPN_ALIAS_RE = re.compile(r"vpn|wireguard|nordlynx|openvpn|tap-windows|proton|tailscale|zerotier|"
+                              r"fortinet|anyconnect|wintun|globalprotect", re.I)
+
+
+def looks_like_vpn(iface):
+    if not iface:
+        return False
+    return bool(WIN_VPN_ALIAS_RE.search(iface)) if IS_WIN else bool(VPN_IFACE_RE.match(iface))
 
 
 def get_network_basics():
@@ -497,17 +533,20 @@ def get_network_basics():
         info["interface"] = iface_or_ip
     if not info["local_ip"]:
         info["local_ip"] = local_ip_towards(gateway or "8.8.8.8")
-    if info["interface"] and VPN_IFACE_RE.match(info["interface"]):
-        info["notes"].append("Your internet traffic seems to go through a VPN (%s). Switch the VPN "
-                             "off and run this again for accurate home-network results." % info["interface"])
     if IS_LINUX and info["local_ip"] and not info["interface"]:
         info["interface"] = parse_ip_addr_iface(run(["ip", "-o", "-4", "addr", "show"]), info["local_ip"])
     if info["local_ip"]:
-        info["prefix"] = safe("prefix", get_prefix_len, info["local_ip"], info["interface"])
+        prefix, alias = safe("prefix", get_prefix_len, info["local_ip"], info["interface"]) or (None, None)
+        info["prefix"] = prefix
+        if alias and not info["interface"]:
+            info["interface"] = alias  # Windows adapter name, e.g. "Wi-Fi" or "Ethernet"
         prefix = info["prefix"] if info["prefix"] is not None else 24
         if info["prefix"] is None:
             info["notes"].append("Could not read the network mask; assumed a standard home network (/24).")
         info["network"] = str(ipaddress.ip_network("%s/%d" % (info["local_ip"], prefix), strict=False))
+    if looks_like_vpn(info["interface"]):
+        info["notes"].append("Your internet traffic seems to go through a VPN (%s). Switch the VPN "
+                             "off and run this again for accurate home-network results." % info["interface"])
     info["dns_servers"] = safe("dns servers", get_dns_servers, info["local_ip"]) or []
     if gateway is None:
         info["notes"].append("Could not find your router's address. Are you connected to a network?")
@@ -668,6 +707,65 @@ def parse_system_profiler(text):
     return info, nearby
 
 
+def _json_key(d, *fragments):
+    """Value of the first key containing all fragments (Apple's JSON keys have long prefixes)."""
+    for k, v in d.items():
+        if all(f in k for f in fragments):
+            return v
+    return None
+
+
+def _pretty_sp_security(value):
+    """'spairport_security_mode_wpa2_personal' -> 'WPA2 Personal'."""
+    if value in (None, ""):
+        return None
+    words = re.sub(r"^s?pairport_security_mode_", "", str(value)).replace("_", " ").split()
+    return " ".join(w.upper() if re.match(r"^(wpa\d?|wep|owe|sae)$", w, re.I) else w.capitalize()
+                    for w in words)
+
+
+def _sp_json_network(entry):
+    props = {"PHY Mode": _json_key(entry, "phymode"),
+             "Channel": _json_key(entry, "channel"),
+             "Security": _pretty_sp_security(_json_key(entry, "security")),
+             "Signal / Noise": _json_key(entry, "signal_noise"),
+             "Transmit Rate": _json_key(entry, "network_rate")}
+    return _sp_network(str(entry.get("_name", "")), {k: str(v) for k, v in props.items() if v not in (None, "")})
+
+
+def parse_system_profiler_json(text):
+    """macOS 'system_profiler -json SPAirPortDataType'. Its keys stay in English whatever the
+    Mac's language is, unlike the plain-text output. -> (info, nearby), or None if unreadable."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    info, nearby = {}, []
+    tops = data.get("SPAirPortDataType") if isinstance(data, dict) else None
+    for top in tops if isinstance(tops, list) else []:
+        if not isinstance(top, dict):
+            continue
+        ifaces = _json_key(top, "airport_interfaces")
+        for iface in ifaces if isinstance(ifaces, list) else []:
+            if not isinstance(iface, dict):
+                continue
+            cur = _json_key(iface, "current_network_information")
+            if isinstance(cur, dict) and not info:
+                info.update(_sp_json_network(cur))
+                info["connected"] = True
+                info["interface"] = iface.get("_name")
+                mac = _json_key(iface, "mac_address")
+                if mac:
+                    info["hw_mac"] = norm_mac(str(mac))
+            others = _json_key(iface, "other_local_wireless_networks")
+            if isinstance(others, list) and not nearby:
+                nearby = [_sp_json_network(o) for o in others if isinstance(o, dict)]
+    return info, nearby
+
+
 def parse_airport_info(text):
     """Older macOS 'airport -I'."""
     kv = {}
@@ -723,6 +821,14 @@ def parse_iw_link(text):
     return info
 
 
+def nm_pct_to_dbm(pct, connected):
+    """NetworkManager's own % scales (from its nm-wifi-utils code): for the connected network
+    30..100 % means -90..-20 dBm; for other networks 0..100 % means -100..-40 dBm."""
+    if connected:
+        return int(round(max(30, min(100, pct)) - 120))
+    return int(round(-40 - (100 - max(0, min(100, pct))) * 0.6))
+
+
 def parse_nmcli_wifi(text):
     """Linux 'nmcli -t -f IN-USE,SSID,BSSID,CHAN,FREQ,RATE,SIGNAL,SECURITY dev wifi list'."""
     nets = []
@@ -734,6 +840,9 @@ def parse_nmcli_wifi(text):
         net = {"in_use": in_use.strip() == "*", "ssid": ssid or "", "bssid": norm_mac(bssid),
                "signal_pct": to_int(signal),
                "security": security.strip() if security.strip() not in ("", "--") else "Open"}
+        if net["signal_pct"] is not None:
+            net["rssi"] = nm_pct_to_dbm(net["signal_pct"], net["in_use"])
+            net["rssi_estimated"] = True
         f = re.match(r"\s*(\d+)", freq)
         ch, band = freq_to_channel(int(f.group(1))) if f else (None, None)
         net["channel"] = ch if ch is not None else to_int(chan)
@@ -786,7 +895,11 @@ def get_wifi_info():
         if not info.get("note"):
             nearby = parse_netsh_networks(run(["netsh", "wlan", "show", "networks", "mode=bssid"]))
     elif IS_MAC:
-        info, nearby = parse_system_profiler(run(["system_profiler", "SPAirPortDataType"], timeout=60))
+        parsed = parse_system_profiler_json(run(["system_profiler", "-json", "SPAirPortDataType"], timeout=60))
+        if parsed and (parsed[0] or parsed[1]):
+            info, nearby = parsed
+        else:  # older macOS without -json, or an unexpected layout: read the text version
+            info, nearby = parse_system_profiler(run(["system_profiler", "SPAirPortDataType"], timeout=60))
         if not info.get("connected") and os.path.exists(AIRPORT_CMD):
             info.update(parse_airport_info(run([AIRPORT_CMD, "-I"])))
         iface = info.get("interface")
@@ -803,8 +916,17 @@ def get_wifi_info():
         iface = linux_wifi_iface()
         info["interface"] = iface
         if iface:
-            info.update(parse_iw_link(run(["iw", "dev", iface, "link"])))
+            for iw in ("iw", "/usr/sbin/iw", "/sbin/iw"):  # older Debian keeps iw off the user's PATH
+                link = run([iw, "dev", iface, "link"])
+                if link.strip():
+                    info.update(parse_iw_link(link))
+                    break
             info["mac"] = norm_mac(read_file("/sys/class/net/%s/address" % iface))
+            if info.get("rssi") is None:  # a real dBm reading beats NetworkManager's percentage
+                rssi = parse_proc_wireless(read_file("/proc/net/wireless"), iface)
+                if rssi is not None:
+                    info["rssi"] = rssi
+                    info["connected"] = True
         nm = parse_nmcli_wifi(run(["nmcli", "-t", "-f", "IN-USE,SSID,BSSID,CHAN,FREQ,RATE,SIGNAL,SECURITY",
                                    "dev", "wifi", "list"], english=False, timeout=30))
         active = [n for n in nm if n["in_use"]]
@@ -812,15 +934,13 @@ def get_wifi_info():
             active = [n for n in active if n.get("bssid") == info["bssid"]] or active
         if active:
             a = active[0]
+            if info.get("rssi") is None and a.get("rssi") is not None:
+                info["rssi"], info["rssi_estimated"] = a["rssi"], True
             for key in ("ssid", "bssid", "channel", "band", "signal_pct", "security"):
                 if info.get(key) in (None, "") and a.get(key) not in (None, ""):
                     info[key] = a[key]
             info["connected"] = True
         nearby = [n for n in nm if not n["in_use"]]
-        if iface and info.get("rssi") is None and info.get("signal_pct") is None:
-            info["rssi"] = parse_proc_wireless(read_file("/proc/net/wireless"), iface)
-            if info["rssi"] is not None:
-                info["connected"] = True
     finalize_wifi(info)
     for n in nearby:
         finalize_wifi(n)
@@ -1427,9 +1547,20 @@ def scan_hosts(network, local_ip):
     return [str(h) for h in net.hosts() if str(h) != local_ip], note
 
 
+def wifi_carries_traffic(basics, wifi):
+    """Is the Wi-Fi adapter the one the internet traffic actually uses?
+    False for a laptop that is also plugged in by cable. None when it can't be told."""
+    if not wifi.get("connected"):
+        return False
+    route_iface, wifi_iface = basics.get("interface"), wifi.get("interface")
+    if route_iface and wifi_iface:
+        return route_iface.lower() == wifi_iface.lower()
+    return None
+
+
 def get_self_mac(basics, wifi):
     """This computer's hardware address on the home network (None if unknown)."""
-    if wifi.get("connected") and wifi.get("mac"):
+    if wifi.get("connected") and wifi.get("mac") and wifi.get("carries_traffic") is not False:
         return wifi["mac"]
     iface = basics.get("interface")
     if iface and IS_LINUX:
@@ -1618,10 +1749,10 @@ class _UploadBody:
         self.left, self.block, self.deadline, self.sent = size, block, deadline, sent_counter
 
     def read(self, n=-1):
+        if self.left <= 0:
+            return b""  # fully sent: let this piece finish even if time is now up
         if time.perf_counter() >= self.deadline:
             raise _StopTransfer()
-        if self.left <= 0:
-            return b""
         if n is None or n < 0:
             n = self.left
         n = min(n, self.left, len(self.block))
@@ -1662,29 +1793,47 @@ def download_worker(base, deadline, counter, errors):
             time.sleep(0.5)
 
 
+def _upload_piece(base, size, block, deadline, sent):
+    """Upload `size` bytes; return the seconds until the server confirmed it had them all."""
+    body = _UploadBody(size, block, deadline, sent)
+    started = time.perf_counter()
+    with _http(base + "/__up", data=body, timeout=30,
+               headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)}) as resp:
+        resp.read()
+    return time.perf_counter() - started
+
+
 def upload_worker(base, deadline, done, sent, errors):
     """Upload in pieces; each piece is timed until the server confirms it has all of it.
     (Counting bytes as they leave would be misleading: the computer's own network
     buffers swallow a second or more of data before anything reaches the internet.)"""
     block = os.urandom(1 << 16)  # random data, so nothing can compress it
+    # Every piece also pays a fixed cost - setting up the connection and waiting one round
+    # trip for the reply. Measure it with tiny uploads and take it off each piece's time,
+    # so high-latency links (satellite, some mobile) aren't reported as slower than they are.
+    overhead = None
+    for _ in range(2):
+        try:
+            took = _upload_piece(base, 1, block, deadline, sent)
+            overhead = took if overhead is None else min(overhead, took)
+        except Exception as exc:
+            if _was_stopped(exc):
+                return
+            _note_error(errors, exc)
+    overhead = overhead or 0.0
     size = 250_000
     while time.perf_counter() < deadline and len(errors) < 30:
-        body = _UploadBody(size, block, deadline, sent)
-        started = time.perf_counter()
         try:
-            with _http(base + "/__up", data=body, timeout=30,
-                       headers={"Content-Type": "application/octet-stream",
-                                "Content-Length": str(size)}) as resp:
-                resp.read()
+            took = _upload_piece(base, size, block, deadline, sent)
         except Exception as exc:
             if _was_stopped(exc):
                 return
             _note_error(errors, exc)
             time.sleep(0.5)
             continue
-        took = time.perf_counter() - started
-        done.append((took, size))
-        if took < 1.5:  # aim for pieces that take a couple of seconds
+        if took - overhead >= 0.25:
+            done.append((took - overhead, size))
+        if took < max(1.5, 3 * overhead):  # aim for pieces that take a couple of seconds
             size = min(size * 2, 64_000_000)
 
 
@@ -1702,16 +1851,25 @@ def upload_rate(per_stream):
     return round(total, 1) if total else None
 
 
-def measure_upload(base, seconds, streams):
-    deadline = time.perf_counter() + seconds
+def measure_upload(base, seconds, streams, warmup=0.0, during=None):
+    t0 = time.perf_counter()
+    deadline = t0 + seconds
     sent, errors = _Counter(), []
     per_stream = [[] for _ in range(streams)]
     threads = [threading.Thread(target=upload_worker, args=(base, deadline, per_stream[i], sent, errors),
                                 daemon=True) for i in range(streams)]
     for t in threads:
         t.start()
-    for t in threads:  # a piece still in flight at the deadline isn't counted; don't wait long for it
-        t.join(max(0.0, deadline - time.perf_counter()) + 3)
+    side = None
+    if during:
+        time.sleep(max(0.0, min(warmup, seconds)))
+        side = threading.Thread(target=during, daemon=True)
+        side.start()
+    join_until = deadline + 3  # a piece still in flight at the deadline isn't counted; don't wait long
+    for t in threads:
+        t.join(max(0.0, join_until - time.perf_counter()))
+    if side:
+        side.join(max(0.0, join_until + 10 - time.perf_counter()))
     return {"mbps": upload_rate(per_stream), "bytes": sent.value, "errors": errors[:3]}
 
 
@@ -1748,10 +1906,11 @@ def measure_throughput(worker, base, seconds, streams, warmup, during=None):
             side.start()
         time.sleep(min(0.2, max(0.0, deadline - now)))
         samples.append((time.perf_counter(), counter.value))
+    join_until = deadline + 5
     for t in threads:
-        t.join(timeout=5)
+        t.join(max(0.0, join_until - time.perf_counter()))
     if side:
-        side.join(timeout=15)
+        side.join(max(0.0, join_until + 10 - time.perf_counter()))
     return {"mbps": rate_from_samples(samples, t0 + warmup), "bytes": counter.value,
             "errors": errors[:3]}
 
@@ -1783,18 +1942,23 @@ def run_speed_test(base, seconds):
     if not ok:
         return {"error": err, "hint": hint}
     warmup = min(2.0, seconds / 4.0)
-    # one ping per second, finishing before the download stops
+    # About one ping per second while the line is busy. Same target (1.1.1.1) as the idle
+    # measurement, and a long timeout, because bad lag can mean replies taking seconds.
     loaded_ping_count = max(3, int(seconds - warmup - 1.5))
-    loaded = {}
+    loaded_down, loaded_up = {}, {}
 
-    def loaded_ping():
-        loaded.update(ping_stats("1.1.1.1", loaded_ping_count, 1000) or {})
+    def pinger(store):
+        return lambda: store.update(ping_stats("1.1.1.1", loaded_ping_count, 3000) or {})
 
-    down = measure_throughput(download_worker, base, seconds, 4, warmup, during=loaded_ping)
-    up = measure_upload(base, seconds, 3)
+    down = measure_throughput(download_worker, base, seconds, 4, warmup, during=pinger(loaded_down))
+    up = measure_upload(base, seconds, 3, warmup, during=pinger(loaded_up))
+    measured = [x for x in (loaded_down, loaded_up) if x.get("sent")]
+    worst = max(measured, key=lambda x: (x.get("loss_pct") or 0, x.get("median_ms") or 0)) if measured else None
     return {"server": colo, "download_mbps": down["mbps"], "upload_mbps": up["mbps"],
             "download_mb": round(down["bytes"] / 1e6), "upload_mb": round(up["bytes"] / 1e6),
-            "loaded_latency": loaded if loaded.get("received") else None,
+            "loaded_latency": worst,
+            "loaded_latency_download": loaded_down or None, "loaded_latency_upload": loaded_up or None,
+            "download_errors": down["errors"], "upload_errors": up["errors"],
             "errors": down["errors"] + up["errors"]}
 
 
@@ -1825,12 +1989,23 @@ def build_findings(d, plan_down=None, plan_up=None):
     lat = d.get("latency") or {}
     speed = d.get("speed") or {}
     on_wifi = bool(wifi.get("connected"))
+    # Did the measurements actually go over Wi-Fi? Not for a laptop that is also on a cable.
+    wifi_path = on_wifi and wifi.get("carries_traffic") is not False
+    wifi_unknown = not on_wifi and bool(wifi.get("note"))  # e.g. Windows hid the Wi-Fi details
     link_rate = max([r for r in (wifi.get("rx_rate"), wifi.get("tx_rate")) if r] or [0]) or None
+    dl, ul = speed.get("download_mbps"), speed.get("upload_mbps")
+    # Some adapters report a very low link rate while idle; a fast download proves it wrong.
+    link_rate_disproved = bool(link_rate and dl and wifi_path and dl > 0.7 * link_rate)
 
     # ---- Wi-Fi connection -------------------------------------------------
     if wifi.get("note"):
         add("CHECK" if not on_wifi else "TIP", "Wi-Fi", "Some Wi-Fi details were hidden by the system",
             wifi["note"])
+    if on_wifi and wifi.get("carries_traffic") is False:
+        add("TIP", "Network", "This computer is also connected by cable",
+            "Its internet traffic goes through '%s' rather than Wi-Fi, so the speed and response-time "
+            "results describe the cable connection. The Wi-Fi details are still accurate. To test the "
+            "Wi-Fi itself, unplug the cable and run the check again." % basics.get("interface"))
     if on_wifi:
         rssi = wifi.get("rssi")
         est = " - estimated from %s%% signal" % wifi.get("signal_pct") if wifi.get("rssi_estimated") else ""
@@ -1849,7 +2024,8 @@ def build_findings(d, plan_down=None, plan_up=None):
                     "router or move the router. " + PLACEMENT_ADVICE)
         if wifi.get("noise") is not None and rssi is not None:
             snr = rssi - wifi["noise"]
-            if snr < 20:
+            # a low ratio with a normal noise floor just means a weak signal (reported above)
+            if snr < 20 and (wifi["noise"] > -85 or rssi >= -67):
                 add("CHECK", "Wi-Fi", "Lots of radio interference (signal is only %d dB above the noise)" % snr,
                     "Something nearby is drowning out the Wi-Fi: other networks on the same channel, "
                     "a microwave, cordless phone, Bluetooth gear or a poorly shielded USB 3 device. "
@@ -1907,13 +2083,14 @@ def build_findings(d, plan_down=None, plan_up=None):
         elif level == "strong":
             add("GOOD", "Security", "Wi-Fi is encrypted with %s" % label)
 
-        if link_rate:
+        if link_rate and not link_rate_disproved:
             if link_rate < 30:
-                add("ACTION", "Wi-Fi", "Your Wi-Fi link runs at only %g Mbps" % link_rate,
+                add("CHECK", "Wi-Fi", "Your Wi-Fi link was running at only %g Mbps" % link_rate,
                     "This is the raw speed between this device and the router; real downloads get "
                     "about half of it. Weak signal, the 2.4 GHz band, interference or an old Wi-Fi "
-                    "adapter cause this. See the signal and band advice.")
-            elif plan_down and link_rate < plan_down * 1.6:
+                    "adapter cause this - see the signal and band advice. (Some devices show a low "
+                    "figure while idle; if the speed test result is fine, ignore this.)")
+            elif plan_down and wifi_path and link_rate < plan_down * 1.6:
                 add("CHECK", "Wi-Fi", "Your Wi-Fi link (%g Mbps) can't carry your full %g Mbps plan" %
                     (link_rate, plan_down),
                     "Wi-Fi usually delivers 50-70% of its link speed. To get your full plan on this "
@@ -1943,29 +2120,39 @@ def build_findings(d, plan_down=None, plan_up=None):
                 "Many routers ignore pings - that is normal and not a problem by itself.")
         elif router_ping_reliable:
             loss, med, jit = router["loss_pct"], router["median_ms"], router["jitter_ms"]
+            link = "Wi-Fi link" if wifi_path else "connection"
+            area = "Wi-Fi" if wifi_path else "Router"
             if loss >= 5:
-                add("ACTION", "Wi-Fi", "%g%% of packets were lost between this computer and the router" % loss,
+                add("ACTION", area, "%g%% of packets were lost between this computer and the router" % loss,
                     "Losses this close to home point to a Wi-Fi problem (weak signal or "
                     "interference) or an overloaded router. Try near the router; restart the "
-                    "router; see the signal and channel advice.")
+                    "router; see the signal and channel advice." if wifi_path else
+                    "Losses this close to home point to a faulty cable or network port, or an "
+                    "overloaded router. Restart the router and try another cable or port.")
             elif loss > 0:
-                add("CHECK", "Wi-Fi", "A few packets (%g%%) were lost on the way to the router" % loss,
-                    "Occasional loss on Wi-Fi causes brief stalls in calls and games.")
+                add("CHECK", area, "A few packets (%g%%) were lost on the way to the router" % loss,
+                    "Occasional loss on the way to the router causes brief stalls in calls and games.")
             if med > 30 or jit > 20:
-                add("CHECK", "Wi-Fi", "Your Wi-Fi link to the router is slow or unsteady "
-                    "(typical %g ms, jitter %g ms)" % (med, jit),
-                    "Healthy Wi-Fi usually answers in under 10 ms. Busy channels, weak signal or "
-                    "heavy use by other devices cause this.")
+                add("CHECK", area, "Your %s to the router is slow or unsteady "
+                    "(typical %g ms, jitter %g ms)" % (link, med, jit),
+                    "A healthy home connection usually answers in under 10 ms. Busy channels, weak "
+                    "signal or heavy use by other devices cause this.")
             elif med <= 10 and loss == 0:
-                add("GOOD", "Wi-Fi", "Your Wi-Fi link to the router is quick and steady (%g ms)" % med)
+                add("GOOD", area, "Your %s to the router is quick and steady (%g ms)" % (link, med))
     if internet.get("received"):
         loss, med, jit = internet["loss_pct"], internet["median_ms"], internet["jitter_ms"]
-        router_loss = router.get("loss_pct", 0) if router.get("received") else 0
-        if loss >= 2 and router_loss < 1:
-            add("CHECK", "Provider", "%g%% of packets were lost beyond your router" % loss,
-                "The loss happens after your router, so it's the modem, the line or your "
-                "provider. Restart the modem/router. If it keeps happening at different times "
-                "of day, report 'packet loss' to your internet provider.")
+        router_measured = bool(router.get("received")) and router_ping_reliable
+        if loss >= 2:
+            if router_measured and router["loss_pct"] < 1:
+                add("CHECK", "Provider", "%g%% of packets were lost beyond your router" % loss,
+                    "The loss happens after your router, so it's the modem, the line or your "
+                    "provider. Restart the modem/router. If it keeps happening at different times "
+                    "of day, report 'packet loss' to your internet provider.")
+            elif not (router_measured and router["loss_pct"] >= 2):  # not already explained above
+                add("CHECK", "Provider", "%g%% of packets to the internet were lost" % loss,
+                    "Your router doesn't answer pings reliably, so it can't be told whether the loss "
+                    "is on your Wi-Fi or beyond the router. Restart the modem and router. If it "
+                    "continues on a computer plugged in by cable, it's the line or your provider.")
         if med > 100:
             add("CHECK", "Provider", "Internet response time is high (%g ms)" % med,
                 "Under 50 ms is typical for cable or fibre. Satellite and some mobile links are "
@@ -1984,32 +2171,47 @@ def build_findings(d, plan_down=None, plan_up=None):
 
     # ---- Bufferbloat -------------------------------------------------------
     loaded = speed.get("loaded_latency") or {}
-    if loaded.get("received") and internet.get("received"):
-        rise = loaded["median_ms"] - internet["median_ms"]
-        if rise >= 100:
-            add("ACTION", "Router", "Everything lags while the connection is busy (+%d ms)" % rise,
+    cloudflare_idle = lat.get("Cloudflare") or {}
+    idle = cloudflare_idle if cloudflare_idle.get("received") else internet  # same target as under load
+    if loaded.get("sent") and idle.get("received"):
+        rise = loaded["median_ms"] - idle["median_ms"] if loaded.get("received") else None
+        lost = loaded.get("loss_pct") or 0
+        what = ", ".join(x for x in ("+%d ms" % rise if rise is not None else None,
+                                     "%g%% of replies lost" % lost if lost >= 20 else None) if x)
+        if lost >= 50 or (rise is not None and rise >= 100):
+            add("ACTION", "Router", "Everything lags while the connection is busy (%s)" % what,
                 "This is called bufferbloat: when one device downloads, streams or backs up, calls "
                 "and games stall for everyone. In the router look for 'QoS', 'Smart Queue "
                 "Management (SQM)', 'Adaptive QoS' or 'bandwidth control', turn it on and enter "
                 "about 90% of your plan's speeds. Not every router has this; if yours doesn't, it's "
                 "a good reason to choose one that does next time.")
-        elif rise >= 30:
-            add("TIP", "Router", "Response time rises somewhat while downloading (+%d ms)" % rise,
+        elif lost >= 20 or (rise is not None and rise >= 30):
+            add("TIP", "Router", "Response time rises while the line is busy (%s)" % what,
                 "Mild bufferbloat. If calls stutter while others stream or download, turn on QoS / "
                 "Smart Queue Management in the router.")
         else:
             add("GOOD", "Router", "Response time stays low even while the line is busy")
 
     # ---- Speed -------------------------------------------------------------
-    dl, ul = speed.get("download_mbps"), speed.get("upload_mbps")
     if speed.get("error"):
         add("CHECK", "Speed", "The speed test couldn't run",
             (speed.get("hint") or "") + " (Details: %s) You can test in a web browser instead at "
             "speed.cloudflare.com or fast.com." % speed["error"])
+    elif "download_mbps" in speed:
+        for part, value, errs in (("download", dl, speed.get("download_errors")),
+                                  ("upload", ul, speed.get("upload_errors"))):
+            if not value:
+                add("CHECK", "Speed", "The %s part of the speed test didn't finish" % part,
+                    ("The error was: %s. " % errs[0] if errs else "") + "Try again later, or test in a "
+                    "web browser at speed.cloudflare.com or fast.com.")
     if dl:
         def why_slow():
-            if not on_wifi:
-                return ("This computer isn't on Wi-Fi, so this is roughly your line speed. Restart "
+            if wifi_unknown:
+                return ("Wi-Fi details were hidden (see above), so it isn't clear whether Wi-Fi or the "
+                        "line is the limit. Allow the details and run again, or test on a computer "
+                        "plugged into the router with a cable.")
+            if not wifi_path:
+                return ("This test didn't go over Wi-Fi, so this is roughly your line speed. Restart "
                         "the modem and router; if it stays low, contact your provider with these numbers.")
             if link_rate and dl >= 0.45 * link_rate:
                 return ("Your Wi-Fi link (%g Mbps) is the bottleneck: Wi-Fi delivers about half its "
@@ -2243,12 +2445,23 @@ def render_report(d, findings):
         if sp.get("hint"):
             w(wrap(sp["hint"], 3))
     else:
-        w("   Download        %s" % ("%g Mbps" % sp["download_mbps"] if sp.get("download_mbps") else "failed"))
-        w("   Upload          %s" % ("%g Mbps" % sp["upload_mbps"] if sp.get("upload_mbps") else "failed"))
-        if sp.get("loaded_latency"):
-            idle = (lat.get("internet") or {}).get("median_ms")
-            w("   While busy      typical %g ms response time%s" % (
-                sp["loaded_latency"]["median_ms"], " (vs %g ms when idle)" % idle if idle is not None else ""))
+        for label, key in (("Download", "download"), ("Upload", "upload")):
+            value = sp.get(key + "_mbps")
+            errs = sp.get(key + "_errors") or []
+            w("   %-15s %s" % (label, "%g Mbps" % value if value else
+                               "did not finish" + (" (%s)" % clean_text(errs[0], 50) if errs else "")))
+        idle = ((lat.get("Cloudflare") or {}) if (lat.get("Cloudflare") or {}).get("received")
+                else (lat.get("internet") or {})).get("median_ms")
+        for label, key in (("During download", "loaded_latency_download"), ("During upload", "loaded_latency_upload")):
+            st = sp.get(key)
+            if st and st.get("sent"):
+                text = ("typical %g ms response time" % st["median_ms"]) if st.get("received") else \
+                    "replies timed out"
+                if st.get("received") and st.get("loss_pct"):
+                    text += ", %g%% lost" % st["loss_pct"]
+                if idle is not None:
+                    text += " (idle: %g ms)" % idle
+                w("   %-15s %s" % (label, text))
         w("   Data used       about %d MB down, %d MB up" % (sp.get("download_mb", 0), sp.get("upload_mb", 0)))
     w("")
 
@@ -2286,7 +2499,8 @@ def render_report(d, findings):
     w("6. YOUR ROUTER")
     if rt.get("ip"):
         w("   Address         %s" % rt["ip"])
-        w("   Admin page      %s  (open it in a web browser on this network)" % rt.get("admin_url"))
+        w("   Admin page      %s  (open it in a web browser on this network)" %
+          (rt.get("admin_url") or "http://%s" % rt["ip"]))
         web = rt.get("web") or {}
         if web.get("title"):
             w("   Page title      %s" % web["title"])
@@ -2395,6 +2609,7 @@ def main(argv=None):
     step("Reading Wi-Fi connection details")
     wifi_nearby = safe("wifi", get_wifi_info) or ({}, [])
     d["wifi"], d["nearby"] = wifi_nearby
+    d["wifi"]["carries_traffic"] = wifi_carries_traffic(d["network"], d["wifi"])
     d["channels"] = safe("channels", analyze_channels, d["wifi"], d["nearby"]) or {}
 
     step("Measuring response times to your router and the internet (about %d seconds)" % ping_count)

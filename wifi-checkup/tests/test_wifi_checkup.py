@@ -911,6 +911,7 @@ class DeviceScanTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 STREAM_RATE = 2_500_000  # bytes per second per connection (20 Mbps)
+RESPONSE_DELAY = 0.0     # extra seconds before answering each upload
 
 
 class _SpeedHandler(http.server.BaseHTTPRequestHandler):
@@ -953,6 +954,7 @@ class _SpeedHandler(http.server.BaseHTTPRequestHandler):
             self._throttled(total, lambda n: self.rfile.read(n))
         except (ConnectionResetError, OSError):
             return
+        time.sleep(RESPONSE_DELAY)  # stands in for a long round trip (e.g. satellite)
         self.send_response(200)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -981,7 +983,8 @@ class SpeedTests(unittest.TestCase):
 
     def test_full_speed_test_matches_server_limit(self):
         orig_ping = wc.ping_stats
-        wc.ping_stats = lambda host, count, timeout_ms=1000: {"received": count, "median_ms": 42.0}
+        wc.ping_stats = lambda host, count, timeout_ms=1000: {"sent": count, "received": count,
+                                                             "loss_pct": 0.0, "median_ms": 42.0}
         try:
             t0 = time.perf_counter()
             res = wc.run_speed_test(self.base, 4)
@@ -997,6 +1000,22 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(res["loaded_latency"]["median_ms"], 42.0)
         self.assertLess(elapsed, 20, "transfers must stop at the deadline")
         self.assertEqual(res["errors"], [])
+
+    def test_upload_on_a_high_latency_link(self):
+        """Each upload waits an extra 0.4 s for its reply; the measured rate must not drop with it."""
+        global RESPONSE_DELAY
+        RESPONSE_DELAY = 0.4
+        try:
+            res = wc.measure_upload(self.base, 6, 3)
+        finally:
+            RESPONSE_DELAY = 0.0
+        expected = 3 * STREAM_RATE * 8 / 1e6
+        self.assertAlmostEqual(res["mbps"], expected, delta=expected * 0.3)
+
+    def test_upload_rate_ignores_quick_pieces(self):
+        streams = [[(0.1, 250_000), (1.0, 2_500_000), (2.0, 5_000_000)], [(1.5, 3_750_000)]]
+        self.assertEqual(wc.upload_rate(streams), 40.0)
+        self.assertIsNone(wc.upload_rate([[], []]))
 
     def test_unreachable_server(self):
         s = socket.socket()
@@ -1031,7 +1050,7 @@ def sample_data(**over):
                 {"ip": "1.1.1.1", "label": "Cloudflare", "role": "public", "median_ms": 15.0,
                  "answered": 8, "failed": 0}],
         "speed": {"server": "BOM", "download_mbps": 11.0, "upload_mbps": 2.0, "download_mb": 14,
-                  "upload_mb": 3, "loaded_latency": {"received": 6, "median_ms": 400.0}},
+                  "upload_mb": 3, "loaded_latency": {"sent": 6, "received": 6, "loss_pct": 0.0, "median_ms": 400.0}},
         "scan": {"devices": [
             {"ip": "192.168.1.1", "mac": "a0:b1:c2:d3:e4:f5", "is_router": True, "status": "router",
              "names": {}, "upnp": {"modelName": "Archer C6"}},
@@ -1058,11 +1077,12 @@ class AdviceTests(unittest.TestCase):
     def test_bad_home_network(self):
         f = wc.build_findings(sample_data(), plan_down=100, plan_up=50)
         actions = " | ".join(self.titles(f, "ACTION"))
-        for expected in ("signal is weak", "outdated security", "only 26 Mbps", "packets were lost",
+        for expected in ("signal is weak", "outdated security", "packets were lost",
                          "lags while the connection is busy", "only 11% of your 100 Mbps plan"):
             self.assertIn(expected, actions)
         checks = " | ".join(self.titles(f, "CHECK"))
-        for expected in ("overlaps its neighbours", "wasn't there last time", "Telnet", "slow or unsteady"):
+        for expected in ("overlaps its neighbours", "wasn't there last time", "Telnet", "slow or unsteady",
+                         "only 26 Mbps"):
             self.assertIn(expected, checks)
         tips = " | ".join(self.titles(f))
         self.assertIn("faster DNS", tips)
@@ -1082,7 +1102,7 @@ class AdviceTests(unittest.TestCase):
                         dns=[{"ip": "192.168.1.1", "label": "Your current DNS", "role": "current", "median_ms": 12.0},
                              {"ip": "1.1.1.1", "label": "Cloudflare", "role": "public", "median_ms": 10.0}],
                         speed={"download_mbps": 280.0, "upload_mbps": 95.0,
-                               "loaded_latency": {"received": 6, "median_ms": 20.0}},
+                               "loaded_latency": {"sent": 6, "received": 6, "loss_pct": 0.0, "median_ms": 20.0}},
                         scan={"devices": [{"ip": "192.168.1.1", "mac": "a0:b1:c2:d3:e4:f5", "status": "router",
                                            "is_router": True, "names": {}}]},
                         router={"ip": "192.168.1.1", "open_ports": [], "upnp": False})
@@ -1152,6 +1172,162 @@ class AdviceTests(unittest.TestCase):
         text = wc.render_report(d, wc.build_findings(d))
         self.assertIn("Not connected by Wi-Fi", text)
         self.assertIn("Router not found", text)
+
+
+SYSTEM_PROFILER_JSON = """{
+  "SPAirPortDataType" : [
+    {
+      "spairport_airport_interfaces" : [
+        {
+          "_name" : "en0",
+          "spairport_airdrop_channel" : 44,
+          "spairport_current_network_information" : {
+            "_name" : "HomeNet",
+            "spairport_network_channel" : "149 (5GHz, 80MHz)",
+            "spairport_network_country_code" : "IN",
+            "spairport_network_mcs" : 5,
+            "spairport_network_phymode" : "802.11ac",
+            "spairport_network_rate" : 234,
+            "spairport_network_type" : "spairport_network_type_station",
+            "spairport_security_mode" : "spairport_security_mode_wpa2_personal",
+            "spairport_signal_noise" : "-71 dBm / -90 dBm"
+          },
+          "spairport_status_information" : "spairport_status_connected",
+          "spairport_supported_channels" : ["1 (2GHz)", "36 (5GHz)"],
+          "spairport_wireless_mac_address" : "f0:2f:4b:aa:bb:cc",
+          "spairport_airport_other_local_wireless_networks" : [
+            {"_name" : "Neighbour", "spairport_network_channel" : 6, "spairport_network_phymode" : "802.11",
+             "spairport_security_mode" : "spairport_security_mode_none",
+             "spairport_signal_noise" : "-70 dBm / -92 dBm"},
+            {"_name" : "Flat3", "spairport_network_channel" : "36 (5GHz, 80MHz)",
+             "spairport_security_mode" : "spairport_security_mode_wpa3_transition"}
+          ]
+        },
+        {"_name" : "awdl0", "spairport_wireless_mac_address" : "2a:bb:cc:dd:ee:ff"}
+      ]
+    }
+  ]
+}"""
+
+
+class ReviewFollowUps(unittest.TestCase):
+    """Cases found in an independent review, each of which used to give wrong or missing advice."""
+
+    def titles(self, findings, level=None):
+        return " | ".join(f["title"] for f in findings if level is None or f["level"] == level)
+
+    def test_mac_json_is_used_and_language_independent(self):
+        info, nearby = wc.parse_system_profiler_json("2026-11-21 warning on stderr\n" + SYSTEM_PROFILER_JSON)
+        wc.finalize_wifi(info)
+        self.assertEqual((info["interface"], info["ssid"], info["channel"], info["band"]), ("en0", "HomeNet", 149, "5 GHz"))
+        self.assertEqual((info["rssi"], info["noise"], info["tx_rate"]), (-71, -90, 234))
+        self.assertEqual(info["security"], "WPA2 Personal")
+        self.assertEqual(info["security_level"], "good")
+        self.assertEqual(info["hw_mac"], "f0:2f:4b:aa:bb:cc")
+        levels = [wc.finalize_wifi(n)["security_level"] for n in nearby]
+        self.assertEqual(levels, ["critical", "strong"])
+        self.assertEqual((nearby[0]["channel"], nearby[0]["band"]), (6, "2.4 GHz"))
+        self.assertIsNone(wc.parse_system_profiler_json("not json"))
+        self.assertEqual(wc.parse_system_profiler_json('{"SPAirPortDataType": []}'), ({}, []))
+
+    def test_windows_route_fallback_and_adapter_names(self):
+        self.assertEqual(wc.parse_ps_routes("192.168.1.1 35\r\n10.8.0.1 101\r\n0.0.0.0 5\r\n"), ("192.168.1.1", None))
+        out = "127.0.0.1/8/Loopback Pseudo-Interface 1\r\n192.168.1.23/24/Wi-Fi\r\n192.168.1.30/24/Ethernet 2\r\n"
+        self.assertEqual((wc.parse_ps_prefix(out, "192.168.1.23"), wc.parse_ps_alias(out, "192.168.1.23")), (24, "Wi-Fi"))
+        self.assertEqual(wc.parse_ps_alias(out, "192.168.1.30"), "Ethernet 2")
+        self.assertTrue(wc.WIN_VPN_ALIAS_RE.search("NordLynx"))
+        self.assertFalse(wc.WIN_VPN_ALIAS_RE.search("Wi-Fi"))
+        self.assertTrue(wc.VPN_IFACE_RE.match("utun3"))
+        self.assertFalse(wc.VPN_IFACE_RE.match("en0"))
+
+    def test_networkmanager_signal_scale(self):
+        nets = wc.parse_nmcli_wifi(NMCLI)
+        active = next(n for n in nets if n["in_use"])
+        self.assertEqual(active["rssi"], 78 - 120)            # connected: 30..100 % = -90..-20 dBm
+        self.assertEqual(nets[0]["rssi"], round(-40 - 35 * 0.6))  # others: 0..100 % = -100..-40 dBm
+        self.assertEqual(wc.signal_label(nets[0]["rssi"]), "Good")  # 65 % is a good signal, not "fair"
+
+    def test_which_connection_carries_traffic(self):
+        self.assertTrue(wc.wifi_carries_traffic({"interface": "wlan0"}, {"connected": True, "interface": "wlan0"}))
+        self.assertTrue(wc.wifi_carries_traffic({"interface": "Wi-Fi"}, {"connected": True, "interface": "wi-fi"}))
+        self.assertFalse(wc.wifi_carries_traffic({"interface": "eth0"}, {"connected": True, "interface": "wlan0"}))
+        self.assertIsNone(wc.wifi_carries_traffic({"interface": None}, {"connected": True, "interface": "en0"}))
+        self.assertFalse(wc.wifi_carries_traffic({"interface": "en0"}, {"connected": False}))
+
+    def test_hidden_windows_details_get_neutral_advice(self):
+        d = sample_data(wifi=wc.finalize_wifi({"note": wc.WIN_LOCATION_HINT}), speed={"download_mbps": 20.0,
+                        "upload_mbps": 10.0})
+        f = wc.build_findings(d, plan_down=100)
+        detail = next(x["detail"] for x in f if "of your 100 Mbps plan" in x["title"])
+        self.assertIn("Wi-Fi details were hidden", detail)
+        self.assertNotIn("didn't go over Wi-Fi", detail)
+
+    def test_laptop_on_cable_and_wifi(self):
+        wifi = wc.finalize_wifi({"ssid": "x", "band": "5 GHz", "channel": 36, "rssi": -50, "rx_rate": 200,
+                                 "security": "WPA2-Personal", "connected": True, "interface": "wlan0"})
+        wifi["carries_traffic"] = False
+        d = sample_data(wifi=wifi, channels={}, speed={"download_mbps": 40.0, "upload_mbps": 10.0},
+                        network={"interface": "eth0", "notes": []})
+        f = wc.build_findings(d, plan_down=500)
+        text = self.titles(f)
+        self.assertIn("also connected by cable", text)
+        self.assertNotIn("can't carry your full", text)
+        detail = next(x["detail"] for x in f if "of your 500 Mbps plan" in x["title"])
+        self.assertIn("didn't go over Wi-Fi", detail)
+        loss = next(x for x in f if "lost between this computer and the router" in x["title"])
+        self.assertIn("cable", loss["detail"])
+
+    def test_loss_when_router_ignores_pings(self):
+        inet = {"sent": 20, "received": 16, "loss_pct": 20.0, "median_ms": 20.0, "jitter_ms": 2.0}
+        d = sample_data(latency={"router": {"sent": 20, "received": 0, "loss_pct": 100.0}, "internet": inet})
+        text = self.titles(wc.build_findings(d))
+        self.assertIn("doesn't answer pings", text)
+        self.assertIn("20% of packets to the internet were lost", text)
+        self.assertNotIn("beyond your router", text)
+
+    def test_loss_when_router_answers_slowly(self):
+        router = {"sent": 20, "received": 14, "loss_pct": 30.0, "median_ms": 40.0, "jitter_ms": 5.0}
+        inet = {"sent": 20, "received": 14, "loss_pct": 30.0, "median_ms": 12.0, "jitter_ms": 2.0}
+        text = self.titles(wc.build_findings(sample_data(latency={"router": router, "internet": inet})))
+        self.assertIn("30% of packets to the internet were lost", text)
+
+    def test_bufferbloat_compares_the_same_server(self):
+        cf = {"sent": 20, "received": 20, "loss_pct": 0.0, "median_ms": 45.0, "jitter_ms": 1.0}
+        google = dict(cf, median_ms=8.0)
+        lat = {"router": dict(cf, median_ms=2.0), "Cloudflare": cf, "Google": google,
+               "internet": dict(google, label="Google")}
+        speed = {"download_mbps": 100.0, "upload_mbps": 20.0,
+                 "loaded_latency": {"sent": 6, "received": 6, "loss_pct": 0.0, "median_ms": 46.0}}
+        f = wc.build_findings(sample_data(latency=lat, speed=speed))
+        self.assertIn("stays low", self.titles(f, "GOOD"))
+
+    def test_bufferbloat_with_timed_out_replies(self):
+        speed = {"download_mbps": 50.0, "upload_mbps": 10.0,
+                 "loaded_latency": {"sent": 6, "received": 0, "loss_pct": 100.0}}
+        f = wc.build_findings(sample_data(speed=speed))
+        self.assertIn("100% of replies lost", self.titles(f, "ACTION"))
+
+    def test_idle_link_rate_disproved_by_download(self):
+        wifi = wc.finalize_wifi({"ssid": "x", "band": "5 GHz", "channel": 36, "rssi": -50, "rx_rate": 6,
+                                 "tx_rate": 6, "security": "WPA2-Personal", "connected": True})
+        f = wc.build_findings(sample_data(wifi=wifi, channels={}, speed={"download_mbps": 300.0, "upload_mbps": 50.0}),
+                              plan_down=300)
+        self.assertNotIn("link was running at only", self.titles(f))
+
+    def test_weak_signal_is_not_called_interference(self):
+        weak = wc.finalize_wifi({"ssid": "x", "rssi": -80, "noise": -92, "connected": True})
+        noisy = wc.finalize_wifi({"ssid": "x", "rssi": -60, "noise": -75, "connected": True})
+        self.assertNotIn("interference", self.titles(wc.build_findings(sample_data(wifi=weak))))
+        self.assertIn("interference", self.titles(wc.build_findings(sample_data(wifi=noisy))))
+
+    def test_partly_failed_speed_test_is_explained(self):
+        speed = {"download_mbps": 80.0, "upload_mbps": None, "download_errors": [],
+                 "upload_errors": ["HTTPError: HTTP Error 429: Too Many Requests"]}
+        f = wc.build_findings(sample_data(speed=speed))
+        item = next(x for x in f if "upload part of the speed test didn't finish" in x["title"])
+        self.assertIn("429", item["detail"])
+        text = wc.render_report(sample_data(speed=dict(speed, download_mb=80, upload_mb=0)), f)
+        self.assertIn("did not finish (HTTPError: HTTP Error 429", text)
 
 
 class EndToEnd(unittest.TestCase):

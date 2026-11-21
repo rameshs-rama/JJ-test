@@ -191,6 +191,7 @@ Log in to your router's admin page and check:
 | *"Windows only shows Wi-Fi details to programs when Location is allowed"* | See step 3 of the Windows instructions above. |
 | *"macOS hid the Wi-Fi network name"* | Harmless. Signal, channel and security are still measured. To see the name, allow Location for Terminal in *System Settings → Privacy & Security → Location Services*. |
 | *"Your internet traffic seems to go through a VPN"* | Turn off the VPN and run again. |
+| *"This computer is also connected by cable"* | The speed results describe the cable, not the Wi-Fi. Unplug the cable and run again to test the Wi-Fi. |
 | *"The device scan was skipped"* | You're on a network that isn't a normal home network, such as a mobile hotspot or some VPNs. |
 | Speed test *certificate* error on Mac | Run *Install Certificates.command* (see Mac instructions). |
 | Fewer devices than the router lists | Normal. Sleeping phones and gadgets don't answer. The router's list is the complete one. |
